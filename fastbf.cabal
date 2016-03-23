@@ -12,9 +12,9 @@ category:            Web
 build-type:          Simple
 cabal-version:       >=1.10
 
-executable fastbf-exe
+executable fastbf
   main-is:             Main.hs
-  ghc-options:         -rtsopts -O2
+  ghc-options:         -rtsopts -O2 -fllvm
   build-depends:       base
                      , bytestring >= 0.10.6.0
                      , deepseq >= 1.4.1.1

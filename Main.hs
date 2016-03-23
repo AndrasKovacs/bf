@@ -1,43 +1,106 @@
-{-# language OverloadedStrings, LambdaCase, BangPatterns, PatternSynonyms #-}
+{-# language
+  OverloadedStrings, LambdaCase, BangPatterns,
+  PatternSynonyms, ViewPatterns, UnboxedTuples,
+  ScopedTypeVariables, NoMonomorphismRestriction #-}
+
+-- {-# options_ghc -Wall #-}
 
 import Control.Applicative
-import Control.Monad
+import Control.DeepSeq
 import Control.Monad.State.Strict
-
-import Control.Monad.Primitive
-import Data.Primitive.ByteArray
-import Data.Primitive.Addr
-import Data.Primitive.Types
+import Data.Bits
+import Data.Char
+import Data.Int
+import Data.Word
+import System.Environment
+import System.Exit
+import Text.Show
 
 import qualified Data.Attoparsec.ByteString.Char8 as P
 import qualified Data.ByteString.Char8 as B
-
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
 
-import Control.DeepSeq
+-- import Debug.Trace
 
-import Data.Int
-import Data.Bits
+helloworld :: B.ByteString
+helloworld =
+  "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++."
 
-import System.Environment
-import System.FilePath
-import System.Directory
+squares :: B.ByteString
+squares = "++++[>+++++<-]>[<+++++>-]+<+[>[>+>+<<-]++>>[<<+>>-]>>>[-]++>[-]+>>>+[[-]++++++>>>]<<<[[<++++++++<++>>-]+<.<[>----<-]<]<<[>>>>>[>>>[-]+++++++++<[>-<-]+++++++++>[-[<->-]+[<<<]]<[>+<-]>]<<-]<<-]"
 
+-- wc :: B.ByteString
+-- wc = ">>>+>>>>>+>>+>>+[<<],[-[-[-[-[-[-[-[-[<+>-[>+<-[>-<-[-[-[<++[<++++++>-]<[>>[-<]<[>]<-]>>[<+>-[<->[-]]]]]]]]]]]]]]]]<[-<<[-]+>]<<[>>>>>>+<<<<<<-]>[>]>>>>>>>+>[<+[>+++++++++<-[>-<-]++>[<+++++++>-[<->-]+[+>>>>>>]]<[>+<-]>[>>>>>++>[-]]+<]>[-<<<<<<]>>>>],]+<++>>>[[+++++>>>>>>]<+>+[[<++++++++>-]<.<<<<<]>>>>>>>>]"
+  
 
-import Data.Function
+-- Main
+--------------------------------------------------------------------------------
 
-
-import Criterion.Main
-
+main :: IO ()
 main = do
-  !inp <- B.readFile  "mandelbrot.bf"
-  defaultMain [bench "opt" $ whnf (V.fromList . map encode . linearize . opt . parse) inp]
+  !inp <- getArgs >>= \case
+    path:[] -> B.readFile path
+    _       -> putStrLn "usage: fastbf PATH" >> exitSuccess
+  run $ noOptCompile inp
+  
 
--- main = do
---   !inp <- B.readFile  "mandelbrot.bf"
---   mapM_ print $ linearize $ opt $ parse $ inp
+-- Opcodes
+--------------------------------------------------------------------------------
 
+-- 64 bit code layout, from least to most significant bits:
+--   4   bits  : opcode      (positive)  
+--   8   bits  : operand arg (positive)
+--   52  bits  : offset  arg (possibly negative)
+
+type Op = Int64
+
+pack :: Int64 -> Int -> Word8 -> Op
+pack op offset arg =
+      op
+  .|. unsafeShiftL (fromIntegral arg) 4
+  .|. unsafeShiftL (fromIntegral offset) 12
+
+unpack1 :: Op -> Int64
+unpack1 op = op .&. 15
+
+unpack2 :: Op -> (Int64, Int)
+unpack2 op = (op .&. 15, fromIntegral (unsafeShiftR op 12))
+
+unpack3 :: Op -> (Int64, Int, Word8)
+unpack3 op = (
+  op .&. 15,
+  fromIntegral (unsafeShiftR op 12),
+  fromIntegral (unsafeShiftR op 4 .&. 255))  
+
+pattern Add o a    <- (unpack3 -> (0 , o, a)) where Add o a    = pack 0  o a
+pattern Mov o      <- (unpack2 -> (1 , o)   ) where Mov o      = pack 1  o 0
+pattern Assign o a <- (unpack3 -> (2 , o, a)) where Assign o a = pack 2  o a
+pattern AddMul o a <- (unpack3 -> (3 , o, a)) where AddMul o a = pack 3  o a
+pattern SetTmp     <- (unpack1 -> 4         ) where SetTmp     = pack 4  0 0
+pattern AddTmp o   <- (unpack2 -> (5 , o)   ) where AddTmp o   = pack 5  o 0
+pattern SubTmp o   <- (unpack2 -> (6 , o)   ) where SubTmp o   = pack 6  o 0
+pattern JZ o       <- (unpack2 -> (7 , o)   ) where JZ o       = pack 7  o 0
+pattern JMP o      <- (unpack2 -> (8 , o)   ) where JMP o      = pack 8  o 0
+pattern Get o      <- (unpack2 -> (9 , o)   ) where Get o      = pack 9  o 0
+pattern Put o      <- (unpack2 -> (10, o)   ) where Put o      = pack 10 o 0
+pattern Halt       <- (unpack1 -> 11        ) where Halt       = pack 11 0 0
+
+showOp :: Op -> String
+showOp = \case
+  Add o a    -> "Add " ++ show o ++ " " ++ show a   
+  Mov o      -> "Mov " ++ show o
+  Assign o a -> "Assign " ++ show o ++ " " ++ show a
+  AddMul o a -> "AddMul " ++ show o ++ " " ++ show a
+  SetTmp     -> "SetTmp"
+  AddTmp o   -> "AddTmp " ++ show o
+  SubTmp o   -> "SubTmp " ++ show o
+  JZ o       -> "JZ " ++ show o
+  JMP o      -> "JMP " ++ show o
+  Get o      -> "Get " ++ show o
+  Put o      -> "Put " ++ show o
+  Halt       -> "Halt"
+  _          -> error "showOp: invalid opcode"
 
 -- AST
 --------------------------------------------------------------------------------
@@ -45,40 +108,16 @@ main = do
 data Block
   = Basic [Op]
   | While [Block]
-  deriving (Show)
 
-data Op
-  = Add !Int !Int    -- offset, operand
-  | Mov !Int         -- operand
-  | Assign !Int !Int -- offset, value
-  | AddMul !Int !Int -- offset, multiplier
-  | SetTmp
-  | AddTmp !Int      -- offset
-  | SubTmp !Int      -- offset
-  | JZ  !Int         -- jump if zero
-  | JMP !Int         -- unconditional jump
-  | Get !Int         -- offset
-  | Put !Int         -- offset    
-  | Halt             
-  deriving (Show)
+instance Show Block where
+  showsPrec n (Basic ops) =
+    showParen (n > 10) (("Basic "++) . showListWith ((++).showOp) ops)
+  showsPrec n (While bs) =
+    showParen (n > 10) (("While "++) . showList bs)
 
 instance NFData Block where
   rnf (Basic ops) = rnf ops
-  rnf (While bs)  = rnf bs
-
-instance  NFData Op where
-  rnf Add{}    = ()
-  rnf Mov{}    = ()
-  rnf Get{}    = ()
-  rnf Put{}    = ()
-  rnf Assign{} = ()
-  rnf AddMul{} = ()
-  rnf SetTmp   = ()
-  rnf AddTmp{} = ()
-  rnf SubTmp{} = ()
-  rnf JZ{}     = ()
-  rnf JMP{}    = ()
-  rnf Halt     = ()
+  rnf (While bs)  = rnf bs  
 
 -- Parsing
 --------------------------------------------------------------------------------
@@ -107,29 +146,23 @@ parse = either (error "Parse error") id
 --------------------------------------------------------------------------------      
 
 optBlock :: [Op] -> [Op]
-optBlock = go 0 where
-  go !o = \case
-    -- update offset
-    Mov o' : ops               -> go (o + o') ops
-    
-    -- rewrite
-    Add _ 0 : ops              -> go o ops
-    Add _ a : Add _ b : ops    -> go o (Add o (a + b) : ops)
-    Assign o v : Add _ a : ops -> go o (Assign o (v + a) : ops)
-    Add _ a : Assign o v : ops -> go o (Assign o v : ops)
+optBlock = merge . offsets 0 where
+  
+  offsets o = \case
+    Mov o'     : ops -> offsets (o + o') ops        
+    Add _ a    : ops -> Add o a    : offsets o ops
+    Get _      : ops -> Get o      : offsets o ops
+    Put _      : ops -> Put o      : offsets o ops
+    Assign _ v : ops -> Assign o v : offsets o ops
+    AddMul _ i : ops -> AddMul o i : offsets o ops
+    other      : ops -> other      : offsets o ops
+    []               -> [Mov o | o /= 0]
+  
+  merge = \case    
+    Add _ 0 : ops                           -> merge ops
+    Add o1 a    : Add o2 b : ops | o1 == o2 -> merge (Add o1 (a + b) : ops)
+    other                  : ops            -> other : merge ops
 
-    -- set offsets
-    Add _ a    : ops -> Add o a    : go o ops
-    Get _      : ops -> Get o      : go o ops
-    Put _      : ops -> Put o      : go o ops
-    Assign _ v : ops -> Assign o v : go o ops
-    AddMul _ i : ops -> AddMul o i : go o ops
-    other      : ops -> other      : go o ops
-
-    -- perform Mov
-    [] -> [Mov o | o /= 0]
-
--- | Assumption: input is already optimized
 loopElim :: [Block] -> Maybe [Op]
 loopElim blocks = do
   ops <- case blocks of
@@ -142,7 +175,7 @@ loopElim blocks = do
         Assign{} -> True
         _        -> False
 
-  guard $ case last ops of Mov{} -> False; _ -> True
+  guard $ sum [o | Mov o <- ops] == 0
   guard $ all eliminable ops
   guard $ sum [a | Add 0 a <- ops] == (-1)
 
@@ -153,7 +186,7 @@ loopElim blocks = do
         Add o n    -> AddMul o n
         other      -> other
 
-  pure $ SetTmp : map tmpIntro ops    
+  pure $ SetTmp : map tmpIntro ops
 
 opt :: [Block] -> [Block]
 opt blocks = 
@@ -162,127 +195,95 @@ opt blocks =
     While bs -> [maybe (While bs') Basic (loopElim bs')]
       where bs' = opt bs
 
--- Bytecode
---------------------------------------------------------------------------------
-
--- 64 bit code layout, least significant bits first:
---   4 bit  : opcode      (positive)
---   30 bit : address arg (positive)
---   30 bit : operand arg (possibly negative)
-
-pack :: Int64 -> Int -> Int -> Int64
-pack op arg1 arg2 =
-      op
-  .|. unsafeShiftL (fromIntegral arg1) 4
-  .|. unsafeShiftL (fromIntegral arg2) 34
-
-unpack0 :: Int64 -> Int64
-unpack0 op = op .&. 15
-
-unpack1 :: Int64 -> (Int64, Int64)
-unpack1 op = (op .&. 15, unsafeShiftR op 4 .&. 1073741823)
-
-unpack2 :: Int64 -> (Int64, Int64, Int64)
-unpack2 op = (op .&. 15, unsafeShiftR op 4 .&. 1073741823, unsafeShiftR op 34)
-
-
--- pattern AddCode o a    = 0  :: Int64
--- pattern MovCode o      = 1  :: Int64
--- pattern AssignCode = 2  :: Int64
--- pattern AddMulCode = 3  :: Int64
--- pattern SetTmpCode = 4  :: Int64
--- pattern AddTmpCode = 5  :: Int64
--- pattern SubTmpCode = 6  :: Int64
--- pattern JZCode     = 7  :: Int64
--- pattern JMPCode    = 8  :: Int64
--- pattern GetCode    = 9  :: Int64
--- pattern PutCode    = 10 :: Int64
--- pattern HaltCode   = 11 :: Int64
-
-addCode    = 0  :: Int64
-movCode    = 1  :: Int64
-assignCode = 2  :: Int64
-addMulCode = 3  :: Int64
-setTmpCode = 4  :: Int64
-addTmpCode = 5  :: Int64
-subTmpCode = 6  :: Int64
-jZCode     = 7  :: Int64
-jMPCode    = 8  :: Int64
-getCode    = 9  :: Int64
-putCode    = 10 :: Int64
-haltCode   = 11 :: Int64
-
-encode :: Op -> Int64
-encode = \case
-  Add o a    -> pack addCode    o a
-  Mov o      -> pack movCode    o 0
-  Assign o a -> pack assignCode o a
-  AddMul o a -> pack addMulCode o a
-  SetTmp     -> pack setTmpCode 0 0
-  AddTmp o   -> pack addTmpCode o 0
-  SubTmp o   -> pack subTmpCode o 0
-  JZ o       -> pack jZCode     o 0
-  JMP o      -> pack jMPCode    o 0
-  Get o      -> pack getCode    o 0
-  Put o      -> pack putCode    o 0
-  Halt       -> pack haltCode   0 0
+-- Code generation
+--------------------------------------------------------------------------------            
 
 linearize :: [Block] -> [Op]
-linearize bs = evalState (go bs) 0 [Halt] where  
+linearize blocks = evalState (go blocks) 0 [Halt] where
+  
   go :: [Block] -> State Int ([Op] -> [Op])
-  go (Basic ops:bs) = do {modify (+(length ops)); ((ops++).) <$> go bs}
+  
+  go (Basic ops:bs) = do
+    modify (+(fromIntegral $ length ops))
+    ((ops++).) <$> go bs
+    
   go (While bs:bss) = do
     open  <- get <* modify (+1)
     bs'   <- go bs
     close <- get <* modify (+1)
     (((JZ (close + 1):) . bs' . (JMP open:)).) <$> go bss
-  go [] = pure id  
-
-compile :: [Op] -> IO (MV.IOVector Int64)
-compile = V.unsafeThaw . V.fromList . map encode
-
-
-  
-
-  
-  
-
-
-
-
-
-
-
--- Pointer to pinned primitive data
--- type role Ptr nominal
--- newtype Ptr a = Ptr Addr
-
--- -- | Offset code
--- offset :: forall a. Prim a => Ptr a -> Int -> Ptr a
--- offset (Ptr addr) i = Ptr (plusAddr addr (i * I# (sizeOf# (undefined :: a))))
--- {-# inline offset #-}
-
--- -- | Read at an offset
--- readOffPtr :: (Prim a, PrimMonad m) => Ptr a -> Int -> m a
--- readOffPtr (Ptr addr) i = readOffAddr addr i
--- {-# inline readOffPtr #-}
-
--- writeOffPtr :: (Prim a, PrimMonad m) => Ptr a -> Int -> a -> m ()
--- writeOffPtr (Ptr addr) i a = writeOffAddr addr i a
--- {-# inline writeOffPtr #-}
-
-
-
--- genByteCode :: [Op] -> IO (Ptr Int)
--- genByteCode
     
+  go [] = pure id
 
 
--- load :: [Block] -> IO (Ptr Int)
--- load blocks = do
-  
+-- Compilation
+--------------------------------------------------------------------------------
 
+type Code = V.Vector Int64
 
+compile :: B.ByteString -> Code
+compile = V.fromList . linearize . opt . parse
 
+noOptCompile :: B.ByteString -> Code
+noOptCompile = V.fromList . linearize . parse
 
+-- Interpretation
+--------------------------------------------------------------------------------
+
+memSize :: Int
+memSize = 30000
+
+_index  = V.unsafeIndex
+_modify = MV.unsafeModify
+_read   = MV.unsafeRead
+_write  = MV.unsafeWrite
+
+-- TODO : use ByteArray instead of Vector
+run :: Code -> IO ()
+run code = do
+  !(dat :: MV.IOVector Word8) <- MV.replicate memSize 0
+
+  let go :: Int -> Int -> Word8 -> IO ()
+      go !ip !i !tmp = do
+        -- dat' <- V.unsafeFreeze dat
+        -- traceShowM (ip, i, tmp, showOp $ vindex code ip, V.take 20 dat')
+        case _index code ip of
+          Add o a -> do
+            _modify dat (+a) (i + o)
+            go (ip + 1) i tmp
+          Mov o -> do
+            go (ip + 1) (i + o) tmp
+          Assign o a -> do
+            _write dat (i + o) a
+            go (ip + 1) i tmp
+          AddMul o a -> do
+            _modify dat (\x -> x + a * tmp) (i + o)
+            go (ip + 1) i tmp
+          SetTmp -> do
+            go (ip + 1) i =<< _read dat i
+          AddTmp o -> do
+            _modify dat (+tmp) (i + o)
+            go (ip + 1) i tmp
+          SubTmp o -> do
+            _modify dat (subtract tmp) (i + o)
+            go (ip + 1) i tmp
+          JZ o -> do
+            _read dat i >>= \case
+              0 -> go o i tmp
+              _ -> go (ip + 1) i tmp
+          JMP o -> do
+            go o i tmp
+          Get o -> do
+            c <- getChar
+            _write dat (i + o) (fromIntegral (ord c))
+            go (ip + 1) i tmp
+          Put o -> do
+            b <- _read dat (i + o)
+            putChar (chr (fromIntegral b))
+            go (ip + 1) i tmp
+          Halt -> do
+            pure ()
+          _ -> error "run: invalid opcode"
+
+  go 0 0 0 
   
