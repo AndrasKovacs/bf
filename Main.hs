@@ -21,18 +21,18 @@ import qualified Data.ByteString.Char8 as B
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
 
--- import Debug.Trace
+import Debug.Trace
+import Control.Concurrent
 
-helloworld :: B.ByteString
-helloworld =
-  "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++."
 
-squares :: B.ByteString
+hello = "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++."
+
 squares = "++++[>+++++<-]>[<+++++>-]+<+[>[>+>+<<-]++>>[<<+>>-]>>>[-]++>[-]+>>>+[[-]++++++>>>]<<<[[<++++++++<++>>-]+<.<[>----<-]<]<<[>>>>>[>>>[-]+++++++++<[>-<-]+++++++++>[-[<->-]+[<<<]]<[>+<-]>]<<-]<<-]"
 
--- wc :: B.ByteString
--- wc = ">>>+>>>>>+>>+>>+[<<],[-[-[-[-[-[-[-[-[<+>-[>+<-[>-<-[-[-[<++[<++++++>-]<[>>[-<]<[>]<-]>>[<+>-[<->[-]]]]]]]]]]]]]]]]<[-<<[-]+>]<<[>>>>>>+<<<<<<-]>[>]>>>>>>>+>[<+[>+++++++++<-[>-<-]++>[<+++++++>-[<->-]+[+>>>>>>]]<[>+<-]>[>>>>>++>[-]]+<]>[-<<<<<<]>>>>],]+<++>>>[[+++++>>>>>>]<+>+[[<++++++++>-]<.<<<<<]>>>>>>>>]"
-  
+hello2 = ">++++++++[-<+++++++++>]<.>>+>-[+]++>++>+++[>[->+++<<+++>]<<]>-----.>->+++..+++.>-.<<+[>[+>+]>>]<--------------.>>.+++.------.--------.>+.>+."
+
+cellSize = "++++++++[>++++++++<-]>[<++++>-]+<[>-<[>++++<-]>[<++++++++>-]<[>++++++++<-]+>[>++++++++++[>+++++<-]>+.-.[-]<<[-]<->]<[>>+++++++[>+++++++<-]>.+++++.[-]<<<-]]>[>++++++++[>+++++++<-]>.[-]<<-]<+++++++++++[>+++>+++++++++>+++++++++>+<<<<-]>-.>-.+++++++.+++++++++++.<.>>.++.+++++++..<-.>>-[[-]<]"
+
 
 -- Main
 --------------------------------------------------------------------------------
@@ -42,8 +42,7 @@ main = do
   !inp <- getArgs >>= \case
     path:[] -> B.readFile path
     _       -> putStrLn "usage: fastbf PATH" >> exitSuccess
-  run $ noOptCompile inp
-  
+  run $ compile $ inp  
 
 -- Opcodes
 --------------------------------------------------------------------------------
@@ -154,14 +153,16 @@ optBlock = merge . offsets 0 where
     Get _      : ops -> Get o      : offsets o ops
     Put _      : ops -> Put o      : offsets o ops
     Assign _ v : ops -> Assign o v : offsets o ops
-    AddMul _ i : ops -> AddMul o i : offsets o ops
     other      : ops -> other      : offsets o ops
     []               -> [Mov o | o /= 0]
   
-  merge = \case    
-    Add _ 0 : ops                           -> merge ops
+  merge = \case
+    Add _ 0 : ops                           -> merge ops    
     Add o1 a    : Add o2 b : ops | o1 == o2 -> merge (Add o1 (a + b) : ops)
+    Assign o1 a : Add o2 b : ops | o1 == o2 -> merge (Assign o1 (a + b) : ops)
+    Add o1 a : Assign o2 b : ops | o1 == o2 -> merge (Assign o2 b : ops)
     other                  : ops            -> other : merge ops
+    []                                      -> []
 
 loopElim :: [Block] -> Maybe [Op]
 loopElim blocks = do
@@ -172,7 +173,6 @@ loopElim blocks = do
   let eliminable = \case
         Add{}    -> True
         Mov{}    -> True
-        Assign{} -> True
         _        -> False
 
   guard $ sum [o | Mov o <- ops] == 0
@@ -192,8 +192,9 @@ opt :: [Block] -> [Block]
 opt blocks = 
   blocks >>= \case
     Basic b  -> [Basic $ optBlock b]
-    While bs -> [maybe (While bs') Basic (loopElim bs')]
-      where bs' = opt bs
+    While bs -> [While $ opt bs]
+    -- While bs -> [maybe (While bs') Basic (loopElim bs')]
+    --   where bs' = opt bs
 
 -- Code generation
 --------------------------------------------------------------------------------            
@@ -245,8 +246,6 @@ run code = do
 
   let go :: Int -> Int -> Word8 -> IO ()
       go !ip !i !tmp = do
-        -- dat' <- V.unsafeFreeze dat
-        -- traceShowM (ip, i, tmp, showOp $ vindex code ip, V.take 20 dat')
         case _index code ip of
           Add o a -> do
             _modify dat (+a) (i + o)
