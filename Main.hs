@@ -32,30 +32,30 @@ main = do
 -- Opcodes
 --------------------------------------------------------------------------------
 
--- 64 bit code layout, from least to most significant bits:
---   4   bits  : opcode      (positive)
+-- 32 bit code layout, from least to most significant bits:
+--   3   bits  : opcode      (positive)
 --   8   bits  : operand arg (positive)
---   52  bits  : offset  arg (possibly negative)
+--   24  bits  : offset  arg (possibly negative)
 
-type Op = Int64
+type Op = Int32
 
-pack :: Int64 -> Int -> Word8 -> Op
+pack :: Int32 -> Int -> Word8 -> Op
 pack op offset arg =
       op
-  .|. unsafeShiftL (fromIntegral arg) 4
-  .|. unsafeShiftL (fromIntegral offset) 12
+  .|. unsafeShiftL (fromIntegral arg) 3
+  .|. unsafeShiftL (fromIntegral offset) 11
 
-unpack1 :: Op -> Int64
-unpack1 op = op .&. 15
+unpack1 :: Op -> Int32
+unpack1 op = op .&. 7
 
-unpack2 :: Op -> (Int64, Int)
-unpack2 op = (op .&. 15, fromIntegral (unsafeShiftR op 12))
+unpack2 :: Op -> (Int32, Int)
+unpack2 op = (op .&. 7, fromIntegral (unsafeShiftR op 11))
 
-unpack3 :: Op -> (Int64, Int, Word8)
+unpack3 :: Op -> (Int32, Int, Word8)
 unpack3 op = (
-  op .&. 15,
-  fromIntegral (unsafeShiftR op 12),
-  fromIntegral (unsafeShiftR op 4 .&. 255))
+  op .&. 7,
+  fromIntegral (unsafeShiftR op 11),
+  fromIntegral (unsafeShiftR op 3 .&. 255))
 
 pattern Add o a    <- (unpack3 -> (0 , o, a)) where Add o a    = pack 0 o a
 pattern Assign o a <- (unpack3 -> (1 , o, a)) where Assign o a = pack 1 o a
@@ -68,7 +68,7 @@ pattern JNZ o      <- (unpack2 -> (6 , o)   ) where JNZ o      = pack 6 o 0
 pattern Halt       <- (unpack1 -> 7         ) where Halt       = pack 7 0 0
 
 isCtrl :: Op -> Bool
-isCtrl op = (op .&. 15) > 3
+isCtrl op = (op .&. 7) > 3
 
 showOp :: Op -> String
 showOp = \case
@@ -174,7 +174,7 @@ linearize blocks = evalState (go blocks) 0 [Halt] where
 -- Compilation
 --------------------------------------------------------------------------------
 
-type Code = V.Vector Int64
+type Code = V.Vector Op
 
 compile :: B.ByteString -> Code
 compile = V.fromList . linearize . opt . parse
@@ -194,8 +194,6 @@ _write  = MV.unsafeWrite
 run :: Code -> IO ()
 run code = do
   !(dat :: MV.IOVector Word8) <- MV.replicate memSize 0
-
-
   let go :: Int -> Int -> IO ()
       go !ip !i = do
         let !op = _index code ip
