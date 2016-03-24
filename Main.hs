@@ -58,13 +58,17 @@ unpack3 op = (
   fromIntegral (unsafeShiftR op 4 .&. 255))
 
 pattern Add o a    <- (unpack3 -> (0 , o, a)) where Add o a    = pack 0 o a
-pattern Mov o      <- (unpack2 -> (1 , o)   ) where Mov o      = pack 1 o 0
-pattern Assign o a <- (unpack3 -> (2 , o, a)) where Assign o a = pack 2 o a
-pattern JZ o       <- (unpack2 -> (3 , o)   ) where JZ o       = pack 3 o 0
-pattern LOOP o     <- (unpack2 -> (4 , o)   ) where LOOP o     = pack 4 o 0
-pattern Get o      <- (unpack2 -> (5 , o)   ) where Get o      = pack 5 o 0
-pattern Put o      <- (unpack2 -> (6, o)    ) where Put o      = pack 6 o 0
+pattern Assign o a <- (unpack3 -> (1 , o, a)) where Assign o a = pack 1 o a
+pattern Get o      <- (unpack2 -> (2 , o)   ) where Get o      = pack 2 o 0
+pattern Put o      <- (unpack2 -> (3, o)    ) where Put o      = pack 3 o 0
+
+pattern Mov o      <- (unpack2 -> (4 , o)   ) where Mov o      = pack 4 o 0
+pattern JZ o       <- (unpack2 -> (5 , o)   ) where JZ o       = pack 5 o 0
+pattern LOOP o     <- (unpack2 -> (6 , o)   ) where LOOP o     = pack 6 o 0
 pattern Halt       <- (unpack1 -> 7         ) where Halt       = pack 7 0 0
+
+isCtrl :: Op -> Bool
+isCtrl op = (op .&. 15) > 3
 
 showOp :: Op -> String
 showOp = \case
@@ -191,48 +195,53 @@ run :: Code -> IO ()
 run code = do
   !(dat :: MV.IOVector Word8) <- MV.replicate memSize 0
 
+
   let go :: Int -> Int -> IO ()
       go !ip !i = do
-        case _index code ip of
-          Add o a -> do
-            _modify dat (+a) (i + o)
-            go (ip + 1) i
-          Mov o ->
-            case (ip + 1, i + o) of
-              (ip, i) ->
-                case _index code ip of
-                  JZ o -> do
-                    _read dat i >>= \case
-                      0 -> go o i
-                      _ -> go (ip + 1) i
-                  LOOP o -> do
-                    _read dat i >>= \case
-                      0 -> go (ip + 1) i
-                      _ -> go o i
-                  Halt -> do
-                    pure ()
-          Assign o a -> do
-            _write dat (i + o) a
-            go (ip + 1) i
-          JZ o -> do
-            _read dat i >>= \case
-              0 -> go o i
-              _ -> go (ip + 1) i
-          LOOP o -> do
-            _read dat i >>= \case
-              0 -> go (ip + 1) i
-              _ -> go o i
-          Get o -> do
-            c <- getChar
-            _write dat (i + o) (fromIntegral (ord c))
-            go (ip + 1) i
-          Put o -> do
-            b <- _read dat (i + o)
-            putChar (chr (fromIntegral b))
-            go (ip + 1) i
-          Halt -> do
-            pure ()
-          _ -> error "run: invalid opcode"
+        let !op = _index code ip
+        if isCtrl op then
+          case op of
+            Mov o ->
+              case (ip + 1, i + o) of
+                (ip, i) ->
+                  case _index code ip of
+                    JZ o -> do
+                      _read dat i >>= \case
+                        0 -> go o i
+                        _ -> go (ip + 1) i
+                    LOOP o -> do
+                      _read dat i >>= \case
+                        0 -> go (ip + 1) i
+                        _ -> go o i
+                    Halt -> do
+                      pure ()
+            JZ o -> do
+              _read dat i >>= \case
+                0 -> go o i
+                _ -> go (ip + 1) i
+            LOOP o -> do
+              _read dat i >>= \case
+                0 -> go (ip + 1) i
+                _ -> go o i
+            Halt -> do
+              pure ()
+        else
+          case op of
+            Add o a -> do
+              _modify dat (+a) (i + o)
+              go (ip + 1) i
+            Assign o a -> do
+              _write dat (i + o) a
+              go (ip + 1) i
+            Get o -> do
+              c <- getChar
+              _write dat (i + o) (fromIntegral (ord c))
+              go (ip + 1) i
+            Put o -> do
+              b <- _read dat (i + o)
+              putChar (chr (fromIntegral b))
+              go (ip + 1) i
+            _ -> error "run: invalid opcode"
 
   go 0 0
 
