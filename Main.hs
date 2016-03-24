@@ -1,10 +1,9 @@
 {-# language
   OverloadedStrings, LambdaCase, BangPatterns,
   PatternSynonyms, ViewPatterns, UnboxedTuples,
-  ScopedTypeVariables, NoMonomorphismRestriction #-}
+  ScopedTypeVariables #-}
 
 import Control.Applicative
-import Control.DeepSeq
 import Control.Monad.State.Strict
 import Data.Bits
 import Data.Char
@@ -16,8 +15,11 @@ import Text.Show
 
 import qualified Data.Attoparsec.ByteString.Char8 as P
 import qualified Data.ByteString.Char8 as B
-import qualified Data.Vector.Unboxed as V
-import qualified Data.Vector.Unboxed.Mutable as MV
+
+import Foreign.Marshal.Array
+import Foreign.Marshal.Alloc
+import Foreign.Storable
+import Foreign.Ptr
 
 -- Main
 --------------------------------------------------------------------------------
@@ -27,7 +29,7 @@ main = do
   !inp <- getArgs >>= \case
     path:[] -> B.readFile path
     _       -> putStrLn "usage: fastbf PATH" >> exitSuccess
-  run $ compile $ inp
+  run $ linearize $ opt $ parse inp
 
 -- Opcodes
 --------------------------------------------------------------------------------
@@ -94,10 +96,6 @@ instance Show Block where
     showParen (n > 10) (("Basic "++) . showListWith ((++).showOp) ops)
   showsPrec n (While bs) =
     showParen (n > 10) (("While "++) . showList bs)
-
-instance NFData Block where
-  rnf (Basic ops) = rnf ops
-  rnf (While bs)  = rnf bs
 
 -- Parsing
 --------------------------------------------------------------------------------
@@ -170,71 +168,63 @@ linearize blocks = evalState (go blocks) 0 [Halt] where
 
   go [] = pure id
 
-
--- Compilation
---------------------------------------------------------------------------------
-
-type Code = V.Vector Op
-
-compile :: B.ByteString -> Code
-compile = V.fromList . linearize . opt . parse
-
 -- Interpretation
 --------------------------------------------------------------------------------
 
 memSize :: Int
 memSize = 30000
 
-_index  = V.unsafeIndex
-_modify = MV.unsafeModify
-_read   = MV.unsafeRead
-_write  = MV.unsafeWrite
+run :: [Op] -> IO ()
+run ops = do
+  !(code :: Ptr Op)    <- newArray ops
+  !(dat  :: Ptr Word8) <- callocArray memSize
 
--- TODO : use ByteArray instead of Vector
-run :: Code -> IO ()
-run code = do
-  !(dat :: MV.IOVector Word8) <- MV.replicate memSize 0
-  let go :: Int -> Int -> IO ()
+  let go :: Ptr Op -> Ptr Word8 -> IO ()
       go !ip !i = do
-        let !op = _index code ip
+        !op <- peek ip
         if isCtrl op then
           case op of
             Mov o ->
-              case (ip + 1, i + o) of
+              case (advancePtr ip 1, advancePtr i o) of
                 (ip, i) ->
-                  case _index code ip of
+                  peek ip >>= \case
                     JZ o -> do
-                      _read dat i >>= \case
-                        0 -> go o i
-                        _ -> go (ip + 1) i
+                      peek i >>= \case
+                        0 -> go (advancePtr code o) i
+                        _ -> go (advancePtr ip 1) i
                     JNZ o -> do
-                      _read dat i >>= \case
-                        0 -> go (ip + 1) i
-                        _ -> go o i
+                      peek i >>= \case
+                        0 -> go (advancePtr ip 1) i
+                        _ -> go (advancePtr code o) i
                     Halt -> do
                       pure ()
             JZ o -> do
-              _read dat i >>= \case
-                0 -> go o i
-                _ -> go (ip + 1) i
+              peek i >>= \case
+                0 -> go (advancePtr code o) i
+                _ -> go (advancePtr ip 1) i
             JNZ o -> do
-              _read dat i >>= \case
-                0 -> go (ip + 1) i
-                _ -> go o i
+              peek i >>= \case
+                0 -> go (advancePtr ip 1) i
+                _ -> go (advancePtr code o) i
             Halt -> do
               pure ()
         else do
           case op of
             Add o a -> do
-              _modify dat (+a) (i + o)
+              let i' = advancePtr i o
+              !val <- peek i'
+              poke i' (val + a)
             Assign o a -> do
-              _write dat (i + o) a
+              poke (advancePtr i o) a
             Get o -> do
               c <- getChar
-              _write dat (i + o) (fromIntegral (ord c))
+              poke (advancePtr i o) (fromIntegral (ord c))
             Put o -> do
-              b <- _read dat (i + o)
+              b <- peek (advancePtr i o)
               putChar (chr (fromIntegral b))
-          go (ip + 1) i
-  go 0 0
+          go (advancePtr ip 1) i
+
+  go code dat
+  free code
+  free dat
 

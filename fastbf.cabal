@@ -17,12 +17,8 @@ executable fastbf
   ghc-options:         -rtsopts -O2 -fllvm
   build-depends:       base
                      , bytestring >= 0.10.6.0
-                     , deepseq >= 1.4.1.1
                      , directory >= 1.2.2.0
                      , filepath >= 1.4.0.0
-                     , criterion
-                     , vector
-                     , primitive
                      , attoparsec
                      , mtl
   default-language:    Haskell2010
