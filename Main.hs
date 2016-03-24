@@ -27,13 +27,13 @@ main = do
   !inp <- getArgs >>= \case
     path:[] -> B.readFile path
     _       -> putStrLn "usage: fastbf PATH" >> exitSuccess
-  run $ compile $ inp  
+  run $ compile $ inp
 
 -- Opcodes
 --------------------------------------------------------------------------------
 
 -- 64 bit code layout, from least to most significant bits:
---   4   bits  : opcode      (positive)  
+--   4   bits  : opcode      (positive)
 --   8   bits  : operand arg (positive)
 --   52  bits  : offset  arg (possibly negative)
 
@@ -55,24 +55,24 @@ unpack3 :: Op -> (Int64, Int, Word8)
 unpack3 op = (
   op .&. 15,
   fromIntegral (unsafeShiftR op 12),
-  fromIntegral (unsafeShiftR op 4 .&. 255))  
+  fromIntegral (unsafeShiftR op 4 .&. 255))
 
 pattern Add o a    <- (unpack3 -> (0 , o, a)) where Add o a    = pack 0 o a
 pattern Mov o      <- (unpack2 -> (1 , o)   ) where Mov o      = pack 1 o 0
 pattern Assign o a <- (unpack3 -> (2 , o, a)) where Assign o a = pack 2 o a
 pattern JZ o       <- (unpack2 -> (3 , o)   ) where JZ o       = pack 3 o 0
-pattern JMP o      <- (unpack2 -> (4 , o)   ) where JMP o      = pack 4 o 0
+pattern LOOP o     <- (unpack2 -> (4 , o)   ) where LOOP o     = pack 4 o 0
 pattern Get o      <- (unpack2 -> (5 , o)   ) where Get o      = pack 5 o 0
 pattern Put o      <- (unpack2 -> (6, o)    ) where Put o      = pack 6 o 0
 pattern Halt       <- (unpack1 -> 7         ) where Halt       = pack 7 0 0
 
 showOp :: Op -> String
 showOp = \case
-  Add o a    -> "Add " ++ show o ++ " " ++ show a   
+  Add o a    -> "Add " ++ show o ++ " " ++ show a
   Mov o      -> "Mov " ++ show o
   Assign o a -> "Assign " ++ show o ++ " " ++ show a
   JZ o       -> "JZ " ++ show o
-  JMP o      -> "JMP " ++ show o
+  LOOP o     -> "LOOP " ++ show o
   Get o      -> "Get " ++ show o
   Put o      -> "Put " ++ show o
   Halt       -> "Halt"
@@ -93,13 +93,13 @@ instance Show Block where
 
 instance NFData Block where
   rnf (Basic ops) = rnf ops
-  rnf (While bs)  = rnf bs  
+  rnf (While bs)  = rnf bs
 
 -- Parsing
 --------------------------------------------------------------------------------
 
 pBasic :: P.Parser [Op]
-pBasic = P.many1' $ 
+pBasic = P.many1' $
       Add 0 1    <$ P.char '+'
   <|> Add 0 (-1) <$ P.char '-'
   <|> Mov 1      <$ P.char '>'
@@ -114,27 +114,27 @@ pBlocks = P.many' $
   <|> While <$> (P.char '[' *> pBlocks <* P.char ']')
 
 parse :: B.ByteString -> [Block]
-parse = either (error "Parse error") id 
+parse = either (error "Parse error") id
       . P.parseOnly (pBlocks <* P.endOfInput)
       . B.filter (P.inClass "+-<>,.[]")
 
 -- Optimization
---------------------------------------------------------------------------------      
+--------------------------------------------------------------------------------
 
 optBlock :: [Op] -> [Op]
 optBlock = merge . offsets 0 where
-  
+
   offsets o = \case
-    Mov o'     : ops -> offsets (o + o') ops        
+    Mov o'     : ops -> offsets (o + o') ops
     Add _ a    : ops -> Add o a    : offsets o ops
     Get _      : ops -> Get o      : offsets o ops
     Put _      : ops -> Put o      : offsets o ops
     Assign _ v : ops -> Assign o v : offsets o ops
     other      : ops -> other      : offsets o ops
     []               -> [Mov o | o /= 0]
-  
+
   merge = \case
-    Add _ 0 : ops                           -> merge ops    
+    Add _ 0 : ops                           -> merge ops
     Add o1 a    : Add o2 b : ops | o1 == o2 -> merge (Add o1 (a + b) : ops)
     Assign o1 a : Add o2 b : ops | o1 == o2 -> merge (Assign o1 (a + b) : ops)
     Add o1 a : Assign o2 b : ops | o1 == o2 -> merge (Assign o2 b : ops)
@@ -151,19 +151,19 @@ opt = map $ \case
 
 linearize :: [Block] -> [Op]
 linearize blocks = evalState (go blocks) 0 [Halt] where
-  
+
   go :: [Block] -> State Int ([Op] -> [Op])
-  
+
   go (Basic ops:bs) = do
     modify (+(fromIntegral $ length ops))
     ((ops++).) <$> go bs
-    
+
   go (While bs:bss) = do
     open  <- get <* modify (+1)
     bs'   <- go bs
     close <- get <* modify (+1)
-    (((JZ (close + 1):) . bs' . (JMP open:)).) <$> go bss
-    
+    (((JZ (close + 1):) . bs' . (LOOP open:)).) <$> go bss
+
   go [] = pure id
 
 
@@ -192,33 +192,35 @@ run code = do
   !(dat :: MV.IOVector Word8) <- MV.replicate memSize 0
 
   let go :: Int -> Int -> IO ()
-      go !ip !i = do          
+      go !ip !i = do
         case _index code ip of
           Add o a -> do
             _modify dat (+a) (i + o)
-            go (ip + 1) i 
+            go (ip + 1) i
           Mov o -> do
-            go (ip + 1) (i + o) 
+            go (ip + 1) (i + o)
           Assign o a -> do
             _write dat (i + o) a
-            go (ip + 1) i 
+            go (ip + 1) i
           JZ o -> do
             _read dat i >>= \case
-              0 -> go o i 
-              _ -> go (ip + 1) i 
-          JMP o -> do
-            go o i 
+              0 -> go o i
+              _ -> go (ip + 1) i
+          LOOP o -> do
+            _read dat i >>= \case
+              0 -> go (ip + 1) i
+              _ -> go (o  + 1) i
           Get o -> do
             c <- getChar
             _write dat (i + o) (fromIntegral (ord c))
-            go (ip + 1) i 
+            go (ip + 1) i
           Put o -> do
             b <- _read dat (i + o)
             putChar (chr (fromIntegral b))
-            go (ip + 1) i 
+            go (ip + 1) i
           Halt -> do
             pure ()
           _ -> error "run: invalid opcode"
 
   go 0 0
-  
+
