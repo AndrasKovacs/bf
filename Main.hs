@@ -162,7 +162,7 @@ linearize blocks = evalState (go blocks) 0 [Halt] where
     open  <- get <* modify (+1)
     bs'   <- go bs
     close <- get <* modify (+1)
-    (((JZ (close + 1):) . bs' . (LOOP open:)).) <$> go bss
+    (((JZ (close + 1):) . bs' . (LOOP (open + 1):)).) <$> go bss
 
   go [] = pure id
 
@@ -197,8 +197,20 @@ run code = do
           Add o a -> do
             _modify dat (+a) (i + o)
             go (ip + 1) i
-          Mov o -> do
-            go (ip + 1) (i + o)
+          Mov o ->
+            case (ip + 1, i + o) of
+              (ip, i) ->
+                case _index code ip of
+                  JZ o -> do
+                    _read dat i >>= \case
+                      0 -> go o i
+                      _ -> go (ip + 1) i
+                  LOOP o -> do
+                    _read dat i >>= \case
+                      0 -> go (ip + 1) i
+                      _ -> go o i
+                  Halt -> do
+                    pure ()
           Assign o a -> do
             _write dat (i + o) a
             go (ip + 1) i
@@ -209,7 +221,7 @@ run code = do
           LOOP o -> do
             _read dat i >>= \case
               0 -> go (ip + 1) i
-              _ -> go (o  + 1) i
+              _ -> go o i
           Get o -> do
             c <- getChar
             _write dat (i + o) (fromIntegral (ord c))
