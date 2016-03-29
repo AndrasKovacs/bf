@@ -25,6 +25,8 @@ import Foreign.Ptr
 
 import Debug.Trace
 
+-- TODO: towers of hanoi segfaults!!!
+
 -- Main
 --------------------------------------------------------------------------------
 
@@ -80,14 +82,16 @@ unpackJ op = (
 
 pattern Add o a    <- (unpack3 -> (0 , o, a)) where Add o a    = pack 0 o a
 pattern Assign o a <- (unpack3 -> (1 , o, a)) where Assign o a = pack 1 o a
-pattern Get o      <- (unpack2 -> (2 , o)   ) where Get o      = pack 2 o 0
-pattern Put o      <- (unpack2 -> (3 , o)   ) where Put o      = pack 3 o 0
-pattern AddMul o a <- (unpack3 -> (4 , o, a)) where AddMul o a = pack 4 o a
+pattern AddMul o a <- (unpack3 -> (2 , o, a)) where AddMul o a = pack 2 o a
+pattern Get o      <- (unpack2 -> (3 , o)   ) where Get o      = pack 3 o 0
+pattern Put o      <- (unpack2 -> (4 , o)   ) where Put o      = pack 4 o 0
 
 pattern MovJZ  o a <- (unpackJ -> (5 , o, a)) where MovJZ o a  = packJ 5 o a
 pattern MovJNZ o a <- (unpackJ -> (6 , o, a)) where MovJNZ o a = packJ 6 o a
-pattern Halt       <- (unpack1 -> 7         ) where Halt       = pack  7 0 0
-pattern Mov o      <- (unpack2 -> (8 , o)   ) where Mov o      = pack  8 o 0
+pattern StartMul o <- (unpack2 -> (7 , o)   ) where StartMul o = pack  7 o 0
+pattern Halt       <- (unpack1 -> 8         ) where Halt       = pack  8 0 0
+
+pattern Mov o      <- (unpack2 -> (9 , o)   ) where Mov o      = pack  9 o 0
 
 isCtrl :: Op -> Bool
 isCtrl op = (op .&. 15) > 4
@@ -100,6 +104,7 @@ showOp = \case
   MovJZ o a  -> "MovJZ " ++ show o ++ " " ++ show a
   MovJNZ o a -> "MovJNZ " ++ show o ++ " " ++ show a
   Mov o      -> "Mov " ++ show o
+  StartMul o -> "StartMul " ++ show o  
   Get o      -> "Get " ++ show o
   Put o      -> "Put " ++ show o
   Halt       -> "Halt"
@@ -183,7 +188,7 @@ loopElim blocks = do
         Add o n -> [AddMul o n]
         other   -> [other]
 
-  pure ((tmpIntro =<< ops) ++ [Assign 0 0], 0)
+  pure (tmpIntro =<< ops, 0)
 
 linearize :: [Block] -> [Op]
 linearize = flatten where
@@ -202,9 +207,7 @@ linearize = flatten where
       
       case loopElim bs of
         Just (ops', o') -> do
-          let ops'' = case o of
-                0 -> ops'
-                _ -> Mov o : ops'
+          let ops'' = StartMul o : ops'
           modify (+(fromIntegral $ length ops''))
           first ((ops''++).) <$> go o' bss
           
@@ -227,54 +230,58 @@ run ops = do
   !(code :: Ptr Op)    <- newArray ops
   !(dat  :: Ptr Word8) <- callocArray memSize
 
-  let go :: Ptr Op -> Ptr Word8 -> IO ()
-      go !ip !i = do
+  let go :: Word8 -> Ptr Op -> Ptr Word8 -> IO ()
+      go !tmp !ip !i = do
         !op <- peek ip
         if isCtrl op then
           case op of
             MovJZ o a -> do
               let !i' = advancePtr i a
               peek i' >>= \case
-                0 -> go (advancePtr code o) i'
-                _ -> go (advancePtr ip 1) i'
+                0 -> go tmp (advancePtr code o) i'
+                _ -> go tmp (advancePtr ip 1) i'
             MovJNZ o a -> do
               let !i' = advancePtr i a              
               peek i' >>= \case
-                0 -> go (advancePtr ip 1) i'
-                _ -> go (advancePtr code o) i'
-            Mov o -> do
-              go (advancePtr ip 1) (advancePtr i o)
+                0 -> go tmp (advancePtr ip 1) i'
+                _ -> go tmp (advancePtr code o) i'
+            StartMul o -> do
+              let !i' = advancePtr i o
+              !val <- peek i'
+              poke i' 0
+              go val (advancePtr ip 1) i'
             Halt -> do
               pure ()
         else do
-          case op of
-            Add o a -> do
-              let i' = advancePtr i o
-              !val <- peek i'
-              poke i' (val + a)
-            Assign o a -> do
-              poke (advancePtr i o) a
-            AddMul o a -> do
-              base <- peek i
-              let i' = advancePtr i o
-              val <- peek i'
-              poke i' (val + a * base)
-            Get o -> do
-              c <- getChar
-              poke (advancePtr i o) (fromIntegral (ord c))
-            Put o -> do
-              b <- peek (advancePtr i o)
-              putChar (chr (fromIntegral b))
-          go (advancePtr ip 1) i
+          if op .&. 15 <= 2 then 
+            case op of
+              Add o a -> do
+                let i' = advancePtr i o
+                !val <- peek i'
+                poke i' (val + a)
+              Assign o a -> do
+                poke (advancePtr i o) a
+              AddMul o a -> do
+                let i' = advancePtr i o
+                val <- peek i'
+                poke i' (val + a * tmp)
+          else
+            case op of
+              Get o -> do
+                c <- getChar
+                poke (advancePtr i o) (fromIntegral (ord c))
+              Put o -> do
+                b <- peek (advancePtr i o)
+                putChar (chr (fromIntegral b))
+          go tmp (advancePtr ip 1) i
 
-  go code dat
+  go 0 code dat
   free code
   free dat
 
 
+-- hello :: B.ByteString
+-- hello = "++++++++++[>+++++++>++++++++++>+++>+<<<<-]>++.>+.+++++++..+++.>++.<<+++++++++++++++.>.+++.------.--------.>+.>."
 
-hello :: B.ByteString
-hello = "++++++++++[>+++++++>++++++++++>+++>+<<<<-]>++.>+.+++++++..+++.>++.<<+++++++++++++++.>.+++.------.--------.>+.>."
-
-hello2 :: B.ByteString
-hello2 = ">++++++++[-<+++++++++>]<.>>+>-[+]++>++>+++[>[->+++<<+++>]<<]>-----.>->+++..+++.>-.<<+[>[+>+]>>]<--------------.>>.+++.------.--------.>+.>+."
+-- hello2 :: B.ByteString
+-- hello2 = ">++++++++[-<+++++++++>]<.>>+>-[+]++>++>+++[>[->+++<<+++>]<<]>-----.>->+++..+++.>-.<<+[>[+>+]>>]<--------------.>>.+++.------.--------.>+.>+."
