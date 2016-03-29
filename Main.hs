@@ -42,61 +42,61 @@ printTest = mapM_ print . zip [0..] . map showOp. linearize . parse
 --------------------------------------------------------------------------------
 
 -- 32 bit code layout, from least to most significant bits:
---   3   bits  : opcode      (positive)
+--   4   bits  : opcode      (positive)
 --   8   bits  : operand arg (positive)
---   21  bits  : offset  arg (possibly negative)
+--   20  bits  : offset  arg (possibly negative)
 
 type Op = Int32
 
 pack :: Int32 -> Int -> Word8 -> Op
 pack op offset arg =
       op
-  .|. (unsafeShiftL (fromIntegral arg) 3)
-  .|. unsafeShiftL (fromIntegral offset) 11
+  .|. (unsafeShiftL (fromIntegral arg) 4)
+  .|. unsafeShiftL (fromIntegral offset) 12
 
 unpack1 :: Op -> Int32
-unpack1 op = op .&. 7
+unpack1 op = op .&. 15
 
 unpack2 :: Op -> (Int32, Int)
-unpack2 op = (op .&. 7, fromIntegral (unsafeShiftR op 11))
+unpack2 op = (op .&. 15, fromIntegral (unsafeShiftR op 12))
 
 unpack3 :: Op -> (Int32, Int, Word8)
 unpack3 op = (
-  op .&. 7,
-  fromIntegral (unsafeShiftR op 11),
-  fromIntegral (unsafeShiftR op 3 .&. 255))
+  op .&. 15,
+  fromIntegral (unsafeShiftR op 12),
+  fromIntegral (unsafeShiftR op 4 .&. 255))
 
 -- Need to pack the jumps differently because of sign extension
 packJ :: Int32 -> Int -> Int -> Op
 packJ op offset arg =
-    op .|. (unsafeShiftL (255 .&. fromIntegral arg) 3)
-    .|. unsafeShiftL (fromIntegral offset) 11
+    op .|. (unsafeShiftL (255 .&. fromIntegral arg) 4)
+    .|. unsafeShiftL (fromIntegral offset) 12
 
 unpackJ :: Op -> (Int32, Int, Int)
 unpackJ op = (
-  op .&. 7,
-  fromIntegral (unsafeShiftR op 11),
-  fromIntegral (unsafeShiftR (unsafeShiftL op 21) 24))      
+  op .&. 15,
+  fromIntegral (unsafeShiftR op 12),
+  fromIntegral (unsafeShiftR (unsafeShiftL op 20) 24))      
 
 pattern Add o a    <- (unpack3 -> (0 , o, a)) where Add o a    = pack 0 o a
 pattern Assign o a <- (unpack3 -> (1 , o, a)) where Assign o a = pack 1 o a
 pattern Get o      <- (unpack2 -> (2 , o)   ) where Get o      = pack 2 o 0
 pattern Put o      <- (unpack2 -> (3 , o)   ) where Put o      = pack 3 o 0
+pattern AddMul o a <- (unpack3 -> (4 , o, a)) where AddMul o a = pack 4 o a
 
-pattern MovJZ  o a <- (unpackJ -> (4 , o, a)) where MovJZ o a  = packJ 4 o a
-pattern MovJNZ o a <- (unpackJ -> (5 , o, a)) where MovJNZ o a = packJ 5 o a
-pattern Halt       <- (unpack1 -> 6         ) where Halt       = pack 6 0 0
-
--- | Intermediate instruction
-pattern Mov o <- (unpack2 -> (7, o::Int)) where Mov o = pack 7 o 0
+pattern MovJZ  o a <- (unpackJ -> (5 , o, a)) where MovJZ o a  = packJ 5 o a
+pattern MovJNZ o a <- (unpackJ -> (6 , o, a)) where MovJNZ o a = packJ 6 o a
+pattern Halt       <- (unpack1 -> 7         ) where Halt       = pack  7 0 0
+pattern Mov o      <- (unpack2 -> (8 , o)   ) where Mov o      = pack  8 o 0
 
 isCtrl :: Op -> Bool
-isCtrl op = (op .&. 7) > 3
+isCtrl op = (op .&. 15) > 4
 
 showOp :: Op -> String
 showOp = \case
   Add o a    -> "Add " ++ show o ++ " " ++ show a
   Assign o a -> "Assign " ++ show o ++ " " ++ show a
+  AddMul o a -> "AddMul " ++ show o ++ " " ++ show a
   MovJZ o a  -> "MovJZ " ++ show o ++ " " ++ show a
   MovJNZ o a -> "MovJNZ " ++ show o ++ " " ++ show a
   Mov o      -> "Mov " ++ show o
@@ -168,6 +168,23 @@ coalesceBlock = first merge . offsets 0 where
 -- Create linear code
 --------------------------------------------------------------------------------
 
+loopElim :: [Block] -> Maybe ([Op], Int)
+loopElim blocks = do
+  (ops, o) <- case blocks of
+    [Basic ops] -> pure $ coalesceBlock ops
+    _           -> empty
+
+  guard $ o == 0
+  guard $ all (\case Add{} -> True; Mov{} -> True; _ -> False) ops
+  guard $ sum [a | Add 0 a <- ops] == (-1)
+
+  let tmpIntro = \case
+        Add 0 _ -> []
+        Add o n -> [AddMul o n]
+        other   -> [other]
+
+  pure ((tmpIntro =<< ops) ++ [Assign 0 0], 0)
+
 linearize :: [Block] -> [Op]
 linearize = flatten where
 
@@ -179,12 +196,24 @@ linearize = flatten where
     go _ (Basic ops:bs) = do
       let (ops', o) = coalesceBlock ops
       modify (+(fromIntegral $ length ops'))
-      first ((ops'++).) <$> go o bs    
+      first ((ops'++).) <$> go o bs
+      
     go o (While bs:bss) = do
-      open      <- get <* modify (+1)
-      (bs', o') <- go 0 bs
-      close     <- get <* modify (+1)
-      first (((MovJZ (close + 1) o:) . bs' . (MovJNZ (open + 1) o':)).) <$> go 0 bss
+      
+      case loopElim bs of
+        Just (ops', o') -> do
+          let ops'' = case o of
+                0 -> ops'
+                _ -> Mov o : ops'
+          modify (+(fromIntegral $ length ops''))
+          first ((ops''++).) <$> go o' bss
+          
+        Nothing -> do
+          open      <- get <* modify (+1)
+          (bs', o') <- go 0 bs
+          close     <- get <* modify (+1)
+          first (((MovJZ (close + 1) o:) . bs' . (MovJNZ (open + 1) o':)).) <$> go 0 bss
+          
     go o [] = pure (id, o)
 
 -- Interpretation
@@ -200,10 +229,7 @@ run ops = do
 
   let go :: Ptr Op -> Ptr Word8 -> IO ()
       go !ip !i = do
-        -- peekDat <- peekArray 10 dat        
         !op <- peek ip
-        -- traceShowM (showOp op, minusPtr ip code, minusPtr i dat, peekDat)
-        -- threadDelay 100000
         if isCtrl op then
           case op of
             MovJZ o a -> do
@@ -216,6 +242,8 @@ run ops = do
               peek i' >>= \case
                 0 -> go (advancePtr ip 1) i'
                 _ -> go (advancePtr code o) i'
+            Mov o -> do
+              go (advancePtr ip 1) (advancePtr i o)
             Halt -> do
               pure ()
         else do
@@ -226,6 +254,11 @@ run ops = do
               poke i' (val + a)
             Assign o a -> do
               poke (advancePtr i o) a
+            AddMul o a -> do
+              base <- peek i
+              let i' = advancePtr i o
+              val <- peek i'
+              poke i' (val + a * base)
             Get o -> do
               c <- getChar
               poke (advancePtr i o) (fromIntegral (ord c))
