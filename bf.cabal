@@ -1,4 +1,4 @@
-name:                fastbf
+name:                bf
 version:             0.1.0.0
 synopsis:            Fast brainfuck interpreter
 description:         Fast brainfuck interpreter.
@@ -12,7 +12,7 @@ category:            Web
 build-type:          Simple
 cabal-version:       >=1.10
 
-executable fastbf
+executable bf
   main-is:             Main.hs
   ghc-options:         -rtsopts -O2 -fllvm
   build-depends:       base
